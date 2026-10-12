@@ -14,7 +14,7 @@ from functools import lru_cache
 st.set_page_config(page_title="台股集保籌碼追蹤 Pro", layout="wide")
 
 # -------------------------------------------------------------
-# 1. 繁體中文字型載入
+# 1. 繁體中文字型載入 (防崩潰安全設置)
 # -------------------------------------------------------------
 my_font = None
 system_cjk_fonts = [
@@ -41,31 +41,28 @@ if installed_font:
 plt.rcParams['axes.unicode_minus'] = False
 
 # -------------------------------------------------------------
-# 2. Google Sheets 雲端連線設定
+# 2. Google Sheets 純讀取設定 (免 Service Account 密鑰)
 # -------------------------------------------------------------
 conn = st.connection("gsheets", type=GSheetsConnection)
 
 def load_google_sheet_data():
+    """從公開 Google Sheets 讀取過往歷史集保紀錄"""
     try:
-        df = conn.read(ttl=60)
+        df = conn.read(ttl=300)
         if df is not None and not df.empty:
             df["資料日期"] = df["資料日期"].astype(str).str.strip()
             df["證券代號"] = df["證券代號"].astype(str).str.strip()
+            df["持股分級"] = pd.to_numeric(df["持股分級"], errors="coerce").fillna(0).astype(int)
+            df["人數"] = pd.to_numeric(df["人數"], errors="coerce").fillna(0).astype(int)
+            df["股數"] = pd.to_numeric(df["股數"], errors="coerce").fillna(0).astype(int)
+            df["佔集保庫存數比例%"] = pd.to_numeric(df["佔集保庫存數比例%"], errors="coerce").fillna(0.0)
             return df
-    except Exception:
-        pass
+    except Exception as e:
+        st.warning(f"Google Sheets 讀取提示: {e}")
     return pd.DataFrame()
 
-def save_to_google_sheet(df):
-    try:
-        conn.update(data=df)
-        return True
-    except Exception as e:
-        st.error(f"寫入 Google Sheets 失敗: {e}")
-        return False
-
 # -------------------------------------------------------------
-# 3. 股票名稱快取 (全市場自動解析)
+# 3. 股票名稱快取 (上市 + 上櫃 全市場自動解析)
 # -------------------------------------------------------------
 COMMON_STOCK_NAMES = {
     "2330": "台積電", "2454": "聯發科", "3037": "欣興", "2317": "鴻海",
@@ -133,7 +130,7 @@ def get_dynamic_thresholds(price):
         return whale_levels, retail_levels, "> 1000 張", "<= 400 張"
 
 # -------------------------------------------------------------
-# 4. TDCC 集保資料抓取與指標計算
+# 4. TDCC 集保當週資料抓取與指標計算
 # -------------------------------------------------------------
 def fetch_latest_tdcc_data():
     url = "https://opendata.tdcc.com.tw/getOD.ashx?id=1-5"
@@ -184,41 +181,54 @@ def calculate_custom_metrics(df_source, target_date, code, whale_levels, retail_
     }
 
 # -------------------------------------------------------------
-# 5. 主畫面與互動流程
+# 5. 記憶上次搜尋的股號 (Session State + Query Params 雙重記憶)
+# -------------------------------------------------------------
+# 優先順序：URL 參數 > Session State > 預設值
+default_stocks = "2330 2454 3037"
+url_stocks = st.query_params.get("stocks", None)
+
+if url_stocks:
+    initial_stock_val = url_stocks
+elif "saved_stocks" in st.session_state:
+    initial_stock_val = st.session_state["saved_stocks"]
+else:
+    initial_stock_val = default_stocks
+
+# -------------------------------------------------------------
+# 6. 主畫面與查詢繪圖流程
 # -------------------------------------------------------------
 st.title("台股集保大戶/散戶/總股東【批次查詢】與【三合一整合圖表】系統 Pro")
 
-stock_input = st.text_input("請輸入股票代碼 (支援多檔，用空格隔開)", value="2330 2454 3037")
+stock_input = st.text_input("請輸入股票代碼 (支援多檔，用空格隔開)", value=initial_stock_val)
 
 if st.button("批次分析與產生圖表", type="primary"):
-    raw_codes = re.split(r'[\s,，]+', stock_input.strip())
+    # 儲存本次輸入的股票代碼至狀態與 URL
+    clean_input = stock_input.strip()
+    st.session_state["saved_stocks"] = clean_input
+    st.query_params["stocks"] = clean_input
+
+    raw_codes = re.split(r'[\s,，]+', clean_input)
     stock_codes = [c.strip() for c in raw_codes if c.strip()]
 
     if not stock_codes:
         st.warning("請輸入至少一個合法的股票代碼！")
     else:
-        with st.spinner("正在連線 Google Sheets 資料庫與抓取集保最新數據..."):
+        with st.spinner("正在讀取歷史紀錄與抓取集保數據..."):
             try:
-                # 1. 抓取當週最新集保
+                # 1. 讀取 Google Sheets 歷史資料庫 (純讀取，安全快速)
+                history_df = load_google_sheet_data()
+
+                # 2. 抓取集保當週最新即時資料
                 latest_df = fetch_latest_tdcc_data()
                 this_week = str(latest_df["資料日期"].iloc[0])
 
-                # 2. 讀取 Google Sheets 歷史資料
-                history_df = load_google_sheet_data()
-                
-                # 3. 合併與去重複
+                # 3. 記憶體中合併歷史與當週資料
                 if not history_df.empty:
                     combined = pd.concat([history_df, latest_df], ignore_index=True)
                 else:
                     combined = latest_df
 
                 combined = combined.drop_duplicates(subset=["資料日期", "證券代號", "持股分級"])
-
-                # 4. 若有新一週資料，自動同步回 Google Sheets
-                if history_df.empty or this_week not in history_df["資料日期"].values:
-                    save_to_google_sheet(combined)
-                    st.info(f"💡 偵測到新週次 {this_week}，已自動永久備份至 Google Sheets！")
-
                 all_dates = sorted(combined["資料日期"].unique(), reverse=True)
 
                 combined_results = []
@@ -234,6 +244,7 @@ if st.button("批次分析與產生圖表", type="primary"):
                         st.error(f"查無代號 {stock_code} 的資料")
                         continue
 
+                    # 抓取最近 5 週歷史資料連線
                     trend_history = {"date": [], "whale_count": [], "retail_count": [], "total_count": []}
                     for d in reversed(all_dates[:5]):
                         m = calculate_custom_metrics(combined, d, stock_code, whale_levels, retail_levels)
@@ -250,6 +261,7 @@ if st.button("批次分析與產生圖表", type="primary"):
                         r_counts = trend_history["retail_count"]
                         t_counts = trend_history["total_count"]
 
+                        # 左 Y 軸 (總股東、散戶)
                         line1 = ax1.plot(dates, t_counts, marker="^", color="blue", linewidth=2, label="總股東")
                         line2 = ax1.plot(dates, r_counts, marker="s", color="green", linewidth=2, label="散戶")
                         ax1.set_ylabel("總股東 / 散戶 (人)", color="blue", fontproperties=my_font)
@@ -261,6 +273,7 @@ if st.button("批次分析與產生圖表", type="primary"):
                         for i, txt in enumerate(r_counts):
                             ax1.annotate(f"{txt:,}", (dates[i], r_counts[i]), textcoords="offset points", xytext=(0, -14), ha="center", color="green", fontsize=9, fontproperties=my_font)
 
+                        # 右 Y 軸 (大戶)
                         ax2 = ax1.twinx()
                         line3 = ax2.plot(dates, w_counts, marker="o", color="red", linewidth=2, linestyle="--", label="大戶")
                         ax2.set_ylabel("大戶 (人)", color="red", fontproperties=my_font)
