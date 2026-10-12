@@ -8,17 +8,15 @@ import yfinance as yf
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 import matplotlib.ticker as ticker
+from streamlit_gsheets import GSheetsConnection
 from functools import lru_cache
 
-# 必須在第一行設定頁面，否則容易白屏
 st.set_page_config(page_title="台股集保籌碼追蹤 Pro", layout="wide")
 
 # -------------------------------------------------------------
-# 1. 繁體中文字型載入 (防崩潰安全寫法)
+# 1. 繁體中文字型載入
 # -------------------------------------------------------------
 my_font = None
-
-# 優先尋找系統內建中文字型 (支援 packages.txt 安裝的 fonts-noto-cjk)
 system_cjk_fonts = [
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
@@ -39,40 +37,35 @@ if installed_font:
         plt.rcParams['font.family'] = my_font.get_name()
     except Exception:
         pass
-else:
-    # 若系統字型未就緒，備用輕量下載 (加入超時防護與防損壞檢查)
-    font_dir = "./fonts"
-    os.makedirs(font_dir, exist_ok=True)
-    font_path = os.path.join(font_dir, "NotoSansTC-Regular.otf")
-    if not os.path.exists(font_path) or os.path.getsize(font_path) < 100000:
-        try:
-            ttf_url = "https://github.com/theicfire/gcmc/raw/master/inst/fonts/NotoSansCJKtc-Regular.otf"
-            r = requests.get(ttf_url, timeout=10)
-            if r.status_code == 200:
-                with open(font_path, "wb") as f:
-                    f.write(r.content)
-        except Exception:
-            pass
-
-    if os.path.exists(font_path) and os.path.getsize(font_path) > 100000:
-        try:
-            fm.fontManager.addfont(font_path)
-            my_font = fm.FontProperties(fname=font_path)
-            plt.rcParams['font.family'] = my_font.get_name()
-        except Exception:
-            pass
 
 plt.rcParams['axes.unicode_minus'] = False
 
 # -------------------------------------------------------------
-# 2. 資料儲存路徑
+# 2. Google Sheets 雲端連線設定
 # -------------------------------------------------------------
-DATA_DIR = "./data"
-os.makedirs(DATA_DIR, exist_ok=True)
-DATA_STORE_PATH = os.path.join(DATA_DIR, "tdcc_history.csv")
+conn = st.connection("gsheets", type=GSheetsConnection)
+
+def load_google_sheet_data():
+    try:
+        df = conn.read(ttl=60)
+        if df is not None and not df.empty:
+            df["資料日期"] = df["資料日期"].astype(str).str.strip()
+            df["證券代號"] = df["證券代號"].astype(str).str.strip()
+            return df
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+def save_to_google_sheet(df):
+    try:
+        conn.update(data=df)
+        return True
+    except Exception as e:
+        st.error(f"寫入 Google Sheets 失敗: {e}")
+        return False
 
 # -------------------------------------------------------------
-# 3. 股票名稱快取 (上市 + 上櫃 全市場自動解析)
+# 3. 股票名稱快取 (全市場自動解析)
 # -------------------------------------------------------------
 COMMON_STOCK_NAMES = {
     "2330": "台積電", "2454": "聯發科", "3037": "欣興", "2317": "鴻海",
@@ -85,40 +78,31 @@ COMMON_STOCK_NAMES = {
 
 @st.cache_data(ttl=86400)
 def fetch_all_stock_names():
-    """一次性快速獲取上市與上櫃全部股票中文名稱 (每日快取)"""
     stock_map = dict(COMMON_STOCK_NAMES)
     headers = {"User-Agent": "Mozilla/5.0"}
-    
-    # 上市清單 (TWSE)
     try:
         r_twse = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", headers=headers, timeout=4)
         if r_twse.status_code == 200:
             for row in r_twse.json():
                 c, n = row.get("Code", "").strip(), row.get("Name", "").strip()
-                if c and n:
-                    stock_map[c] = n
+                if c and n: stock_map[c] = n
     except Exception:
         pass
-
-    # 上櫃清單 (TPEX)
     try:
         tpex_url = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes"
         r_tpex = requests.get(tpex_url, headers=headers, timeout=4)
         if r_tpex.status_code == 200:
             for row in r_tpex.json():
                 c, n = row.get("SecuritiesCompanyCode", "").strip(), row.get("CompanyName", "").strip()
-                if c and n:
-                    stock_map[c] = n
+                if c and n: stock_map[c] = n
     except Exception:
         pass
-
     return stock_map
 
 def get_stock_name(code):
     code = str(code).strip()
     if code in COMMON_STOCK_NAMES:
         return COMMON_STOCK_NAMES[code]
-    
     stock_map = fetch_all_stock_names()
     return stock_map.get(code, f"台股 {code}")
 
@@ -127,7 +111,6 @@ def get_stock_info(code):
     code = str(code).strip()
     name = get_stock_name(code)
     price = None
-
     for suffix in [".TW", ".TWO"]:
         try:
             ticker = yf.Ticker(f"{code}{suffix}")
@@ -137,12 +120,8 @@ def get_stock_info(code):
                 break
         except Exception:
             pass
-
     return price, name
 
-# -------------------------------------------------------------
-# 4. 集保分級標準定義 (修正 400 張門檻包含 12~15 級)
-# -------------------------------------------------------------
 def get_dynamic_thresholds(price):
     if price is not None and price >= 1000:
         whale_levels = [12, 13, 14, 15]
@@ -154,7 +133,7 @@ def get_dynamic_thresholds(price):
         return whale_levels, retail_levels, "> 1000 張", "<= 400 張"
 
 # -------------------------------------------------------------
-# 5. TDCC 集保資料抓取與指標計算
+# 4. TDCC 集保資料抓取與指標計算
 # -------------------------------------------------------------
 def fetch_latest_tdcc_data():
     url = "https://opendata.tdcc.com.tw/getOD.ashx?id=1-5"
@@ -185,7 +164,7 @@ def fetch_latest_tdcc_data():
     return std_df
 
 def calculate_custom_metrics(df_source, target_date, code, whale_levels, retail_levels):
-    sub = df_source[(df_source["資料日期"] == target_date) & (df_source["證券代號"] == code)]
+    sub = df_source[(df_source["資料日期"] == str(target_date)) & (df_source["證券代號"] == str(code))]
     if sub.empty:
         return None
 
@@ -205,7 +184,7 @@ def calculate_custom_metrics(df_source, target_date, code, whale_levels, retail_
     }
 
 # -------------------------------------------------------------
-# 6. Streamlit 網頁畫面與互動邏輯
+# 5. 主畫面與互動流程
 # -------------------------------------------------------------
 st.title("台股集保大戶/散戶/總股東【批次查詢】與【三合一整合圖表】系統 Pro")
 
@@ -218,23 +197,29 @@ if st.button("批次分析與產生圖表", type="primary"):
     if not stock_codes:
         st.warning("請輸入至少一個合法的股票代碼！")
     else:
-        with st.spinner("正在抓取集保數據與繪製圖表..."):
+        with st.spinner("正在連線 Google Sheets 資料庫與抓取集保最新數據..."):
             try:
+                # 1. 抓取當週最新集保
                 latest_df = fetch_latest_tdcc_data()
-                if os.path.exists(DATA_STORE_PATH):
-                    try:
-                        history_df = pd.read_csv(DATA_STORE_PATH, dtype={"證券代號": str, "資料日期": str})
-                        combined = pd.concat([history_df, latest_df], ignore_index=True)
-                    except Exception:
-                        combined = latest_df
+                this_week = str(latest_df["資料日期"].iloc[0])
+
+                # 2. 讀取 Google Sheets 歷史資料
+                history_df = load_google_sheet_data()
+                
+                # 3. 合併與去重複
+                if not history_df.empty:
+                    combined = pd.concat([history_df, latest_df], ignore_index=True)
                 else:
                     combined = latest_df
 
                 combined = combined.drop_duplicates(subset=["資料日期", "證券代號", "持股分級"])
-                combined.to_csv(DATA_STORE_PATH, index=False, encoding="utf-8-sig")
+
+                # 4. 若有新一週資料，自動同步回 Google Sheets
+                if history_df.empty or this_week not in history_df["資料日期"].values:
+                    save_to_google_sheet(combined)
+                    st.info(f"💡 偵測到新週次 {this_week}，已自動永久備份至 Google Sheets！")
 
                 all_dates = sorted(combined["資料日期"].unique(), reverse=True)
-                this_week = all_dates[0]
 
                 combined_results = []
                 n_stocks = len(stock_codes)
@@ -265,7 +250,6 @@ if st.button("批次分析與產生圖表", type="primary"):
                         r_counts = trend_history["retail_count"]
                         t_counts = trend_history["total_count"]
 
-                        # 左 Y 軸 (總股東、散戶)
                         line1 = ax1.plot(dates, t_counts, marker="^", color="blue", linewidth=2, label="總股東")
                         line2 = ax1.plot(dates, r_counts, marker="s", color="green", linewidth=2, label="散戶")
                         ax1.set_ylabel("總股東 / 散戶 (人)", color="blue", fontproperties=my_font)
@@ -277,7 +261,6 @@ if st.button("批次分析與產生圖表", type="primary"):
                         for i, txt in enumerate(r_counts):
                             ax1.annotate(f"{txt:,}", (dates[i], r_counts[i]), textcoords="offset points", xytext=(0, -14), ha="center", color="green", fontsize=9, fontproperties=my_font)
 
-                        # 右 Y 軸 (大戶)
                         ax2 = ax1.twinx()
                         line3 = ax2.plot(dates, w_counts, marker="o", color="red", linewidth=2, linestyle="--", label="大戶")
                         ax2.set_ylabel("大戶 (人)", color="red", fontproperties=my_font)
@@ -307,7 +290,6 @@ if st.button("批次分析與產生圖表", type="primary"):
                     })
 
                 st.success(f"最新集保日期: {this_week}")
-                
                 st.subheader("批次彙整分析報表")
                 st.dataframe(pd.DataFrame(combined_results), use_container_width=True)
 
