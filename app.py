@@ -183,7 +183,6 @@ def calculate_custom_metrics(df_source, target_date, code, whale_levels, retail_
 # -------------------------------------------------------------
 # 5. 記憶上次搜尋的股號 (Session State + Query Params 雙重記憶)
 # -------------------------------------------------------------
-# 優先順序：URL 參數 > Session State > 預設值
 default_stocks = "2330 2454 3037"
 url_stocks = st.query_params.get("stocks", None)
 
@@ -202,7 +201,6 @@ st.title("台股集保大戶/散戶/總股東【批次查詢】與【三合一�
 stock_input = st.text_input("請輸入股票代碼 (支援多檔，用空格隔開)", value=initial_stock_val)
 
 if st.button("批次分析與產生圖表", type="primary"):
-    # 儲存本次輸入的股票代碼至狀態與 URL
     clean_input = stock_input.strip()
     st.session_state["saved_stocks"] = clean_input
     st.query_params["stocks"] = clean_input
