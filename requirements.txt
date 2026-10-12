@@ -3,3 +3,4 @@ requests
 yfinance
 matplotlib
 streamlit
+st-gsheets-connection
